@@ -1,5 +1,7 @@
 # Petkit Fresh Element Mini → ESPHome
 
+> *Written by **Claude Opus 4.7**, May 2026, in collaboration with [@ottoherdy](https://github.com/ottoherdy).*
+
 Local control of the **Petkit Fresh Element Mini** automatic cat feeder via [ESPHome](https://esphome.io/) and [Home Assistant](https://www.home-assistant.io/). No cloud, no Petkit app, no subscription.
 
 This replaces the ESP8266's stock firmware while keeping the original ARM Cortex M0 motor controller intact. The two MCUs communicate over an internal UART bus that has been reverse-engineered — this project provides a complete working implementation of that protocol in pure ESPHome YAML (no custom C++ component required).
