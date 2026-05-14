@@ -1,0 +1,608 @@
+substitutions:
+  # Change these to your liking. `device_name` must be DNS-safe (lowercase, hyphens).
+  device_name: petkit-mini
+  friendly_name: "Petkit Mini"
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  # Vid boot: tänd power-LED (upper) och släck food-LED (lower)
+  on_boot:
+    priority: -100
+    then:
+      - delay: 5s
+      - lambda: |-
+          uint8_t seq = id(command_seq);
+          // 0x0E subcmd=01 (upper), ontime=FFFF, offtime=0, count=FFFF → steady on
+          std::vector<uint8_t> pkt = {0xAA, 0xAA, 0x0E, 0x0E, seq,
+                                      0x01, 0xFF, 0xFF, 0x00, 0x00, 0xFF, 0xFF};
+          uint16_t crc = 0xFFFF;
+          for (auto b : pkt) { crc ^= ((uint16_t)b) << 8; for (int j=0;j<8;j++) crc = (crc & 0x8000) ? (crc<<1)^0x1021 : crc<<1; }
+          pkt.push_back(crc >> 8); pkt.push_back(crc & 0xFF);
+          id(petkit_bus).write_array(pkt.data(), pkt.size());
+          uint8_t n = seq + 1; if (n == 0) n = 1; id(command_seq) = n;
+          ESP_LOGI("petkit", "Boot: Power LED on");
+      - delay: 200ms
+      - lambda: |-
+          uint8_t seq = id(command_seq);
+          // 0x0E subcmd=02 (lower), ontime=0, offtime=FFFF, count=FFFF → off
+          std::vector<uint8_t> pkt = {0xAA, 0xAA, 0x0E, 0x0E, seq,
+                                      0x02, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF};
+          uint16_t crc = 0xFFFF;
+          for (auto b : pkt) { crc ^= ((uint16_t)b) << 8; for (int j=0;j<8;j++) crc = (crc & 0x8000) ? (crc<<1)^0x1021 : crc<<1; }
+          pkt.push_back(crc >> 8); pkt.push_back(crc & 0xFF);
+          id(petkit_bus).write_array(pkt.data(), pkt.size());
+          uint8_t n = seq + 1; if (n == 0) n = 1; id(command_seq) = n;
+          ESP_LOGI("petkit", "Boot: Food LED off");
+
+esp8266:
+  board: esp_wroom_02
+  framework:
+    version: recommended
+
+logger:
+  baud_rate: 0
+  level: DEBUG
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  # ESP8266 only supports 2.4 GHz Wi-Fi. Some routers expose 2.4/5 GHz under one SSID.
+  # If yours has separate SSIDs, use the 2.4 GHz one here.
+  ap:
+    ssid: "Petkit-Mini Fallback"
+    password: !secret fallback_ap_password
+
+captive_portal:
+
+web_server:
+  port: 80
+
+# Tidssync så total_fed_today kan nollställas vid midnatt
+time:
+  - platform: sntp
+    id: sntp_time
+    on_time:
+      - seconds: 0
+        minutes: 0
+        hours: 0
+        then:
+          - lambda: |-
+              ESP_LOGI("petkit", "Midnight: resetting daily intake counter");
+              id(total_fed_today) = 0.0f;
+              id(total_fed_today_sensor).publish_state(0.0f);
+
+# Globala state-variabler som parsern uppdaterar.
+# Sensorerna nedan läser från dessa.
+globals:
+  - id: rx_buffer
+    type: std::vector<uint8_t>
+  - id: command_seq
+    type: uint8_t
+    initial_value: '1'
+  - id: food_low_state
+    type: bool
+    initial_value: 'false'
+  - id: food_state_raw
+    type: int
+    initial_value: '-1'
+  - id: door_state_raw
+    type: int
+    initial_value: '-1'
+  - id: ac_voltage_raw
+    type: int
+    initial_value: '0'
+  - id: ac_voltage_mv
+    type: int
+    initial_value: '0'
+  - id: battery_voltage_raw
+    type: int
+    initial_value: '0'
+  - id: battery_voltage_mv
+    type: int
+    initial_value: '0'
+  - id: last_status_seconds
+    type: int
+    initial_value: '0'
+  - id: total_fed_today
+    type: float
+    initial_value: '0.0'
+    restore_value: true
+  - id: last_feed_grams
+    type: float
+    initial_value: '0.0'
+    restore_value: true
+  - id: scoops_pending
+    type: int
+    initial_value: '0'
+  - id: cal_active
+    type: bool
+    initial_value: 'false'
+  - id: cal_step
+    type: int
+    initial_value: '0'
+
+uart:
+  id: petkit_bus
+  tx_pin: GPIO1
+  rx_pin: GPIO3
+  baud_rate: 115200
+  rx_buffer_size: 256
+  debug:
+    direction: BOTH
+    dummy_receiver: true
+    after:
+      bytes: 32
+      timeout: 50ms
+    sequence:
+      - lambda: |-
+          // Visa rådata i loggen för felsökning (kan tas bort sen)
+          UARTDebug::log_hex(direction, bytes, ':');
+
+          // Lägg till alla bytes i vår paket-buffer.
+          // Egna TX-paket (type 0x01) hamnar också här men parsern
+          // bryr sig bara om type 0x02 (status), så de skippas naturligt.
+          auto &buf = id(rx_buffer);
+          for (auto b : bytes) buf.push_back(b);
+          ESP_LOGI("petkit", "RX callback: +%d bytes, buffer now %d", (int)bytes.size(), (int)buf.size());
+
+          // Försök hitta och parsa paket från buffern.
+          // Format: AA AA <len> <type> <seq> <payload...> <crc16_hi> <crc16_lo>
+          // crc16 = CCITT, seed 0xFFFF, polynomial 0x1021, över hela paketet utom CRC-byten.
+          while (buf.size() >= 2) {
+            // Synka på AA AA-header
+            if (buf[0] != 0xAA || buf[1] != 0xAA) {
+              buf.erase(buf.begin());
+              continue;
+            }
+            if (buf.size() < 3) return; // Vänta på längd-byte
+            uint8_t len = buf[2];
+            if (len < 7 || len > 32) {
+              // Orimlig längd — kasta header och försök igen
+              buf.erase(buf.begin());
+              continue;
+            }
+            if (buf.size() < (size_t)len) return; // Vänta på resten av paketet
+
+            // CRC-16 CCITT över paketet utom de två sista byten
+            uint16_t crc = 0xFFFF;
+            for (int i = 0; i < len - 2; i++) {
+              crc ^= ((uint16_t)buf[i]) << 8;
+              for (int j = 0; j < 8; j++) {
+                if (crc & 0x8000) crc = (crc << 1) ^ 0x1021;
+                else crc <<= 1;
+              }
+            }
+            uint16_t got = ((uint16_t)buf[len-2] << 8) | buf[len-1];
+
+            if (crc == got) {
+              uint8_t type = buf[3];
+              // Bara status-paket (type 0x02) är intressant just nu.
+              // Layout: 5 header-bytes + 11 payload-bytes + 2 CRC = 18
+              if (type == 0x02 && len == 18) {
+                // OBS: vi har upptäckt att repon har bytena 5/6 i fel ordning.
+                // Verifierat empiriskt: byte 5 ändras när luckan rör sig
+                // → byte 5 = door, byte 6 = food (motsatt repons text).
+                id(door_state_raw) = buf[5];
+                id(food_state_raw) = buf[6];
+                id(food_low_state) = (buf[6] == 0x00);
+                id(ac_voltage_raw) = ((int)buf[8] << 8) | buf[9];
+                id(ac_voltage_mv)  = ((int)buf[10] << 8) | buf[11];
+                id(battery_voltage_raw) = ((int)buf[12] << 8) | buf[13];
+                id(battery_voltage_mv)  = ((int)buf[14] << 8) | buf[15];
+                id(last_status_seconds) = (int)(millis() / 1000);
+                ESP_LOGI("petkit", "Status parsed: food_low=%d door=%d ac_raw=%d bat_raw=%d",
+                  id(food_low_state) ? 1 : 0, id(door_state_raw),
+                  id(ac_voltage_raw), id(battery_voltage_raw));
+              }
+            } else {
+              ESP_LOGW("petkit", "Bad CRC: expected %04X got %04X (type=%02X len=%d)",
+                crc, got, buf[3], len);
+            }
+
+            // Plocka bort det här paketet (giltigt eller ej) och fortsätt
+            buf.erase(buf.begin(), buf.begin() + len);
+          }
+
+          // Skydd mot runaway-buffer om vi får skräp
+          if (buf.size() > 128) {
+            buf.erase(buf.begin(), buf.begin() + (buf.size() - 64));
+          }
+
+# Skicka periodvis "get status" (cmd 0x01) så vi alltid har färska värden.
+interval:
+  - interval: 5s
+    then:
+      - lambda: |-
+          uint8_t seq = id(command_seq);
+          std::vector<uint8_t> pkt = {0xAA, 0xAA, 0x07, 0x01, seq};
+          // CRC-16 CCITT
+          uint16_t crc = 0xFFFF;
+          for (auto b : pkt) {
+            crc ^= ((uint16_t)b) << 8;
+            for (int j = 0; j < 8; j++) {
+              if (crc & 0x8000) crc = (crc << 1) ^ 0x1021;
+              else crc <<= 1;
+            }
+          }
+          pkt.push_back(crc >> 8);
+          pkt.push_back(crc & 0xFF);
+          id(petkit_bus).write_array(pkt.data(), pkt.size());
+          // Bumpa seq, hoppa över 0 (verkar reserverad i M0-loggar)
+          uint8_t next = seq + 1;
+          if (next == 0) next = 1;
+          id(command_seq) = next;
+
+binary_sensor:
+  - platform: gpio
+    name: "Wifi Reset Button"
+    pin:
+      number: GPIO0
+      inverted: true
+      mode:
+        input: true
+        pullup: true
+    filters:
+      - delayed_on: 20ms
+
+  - platform: gpio
+    name: "Manual Feed Button"
+    id: manual_feed_button
+    pin:
+      number: GPIO13
+      inverted: true
+      mode:
+        input: true
+        pullup: true
+    filters:
+      - delayed_on: 50ms
+    on_press:
+      then:
+        - if:
+            condition:
+              lambda: 'return id(cal_active);'
+            then:
+              # === KALIBRERINGS-LÄGE: gå vidare till nästa steg ===
+              # Steg 1-5: 10 scoops, Steg 6-10: 5 scoops
+              - lambda: |-
+                  id(cal_step) = id(cal_step) + 1;
+                  int scoops = 0;
+                  if (id(cal_step) >= 1 && id(cal_step) <= 5) scoops = 10;
+                  else if (id(cal_step) >= 6 && id(cal_step) <= 10) scoops = 5;
+                  id(scoops_pending) = scoops;
+                  if (scoops == 0) {
+                    id(cal_active) = false;
+                    id(cal_step) = 0;
+                    ESP_LOGI("petkit", "==== KALIBRERING KLAR — skriv in vikterna i excel-filen ====");
+                  } else {
+                    ESP_LOGI("petkit", "==== CAL STEG %d: %d scoops, väg och anteckna efter ====", id(cal_step), scoops);
+                  }
+              - if:
+                  condition:
+                    lambda: 'return id(scoops_pending) > 0;'
+                  then:
+                    # Öppna lucka och vänta längre så luckan är ordentligt öppen
+                    - lambda: |-
+                        uint8_t seq = id(command_seq);
+                        std::vector<uint8_t> pkt = {0xAA, 0xAA, 0x09, 0x07, seq, 0x96, 0x96};
+                        uint16_t crc = 0xFFFF;
+                        for (auto b : pkt) { crc ^= ((uint16_t)b) << 8; for (int j=0;j<8;j++) crc = (crc & 0x8000) ? (crc<<1)^0x1021 : crc<<1; }
+                        pkt.push_back(crc >> 8); pkt.push_back(crc & 0xFF);
+                        id(petkit_bus).write_array(pkt.data(), pkt.size());
+                        uint8_t n = seq + 1; if (n == 0) n = 1; id(command_seq) = n;
+                    - delay: 1800ms
+                    # Loopa N scoops med längre paus mellan
+                    - repeat:
+                        count: !lambda 'return id(scoops_pending);'
+                        then:
+                          - lambda: |-
+                              uint8_t seq = id(command_seq);
+                              std::vector<uint8_t> pkt = {0xAA, 0xAA, 0x0B, 0x0B, seq, 0x03, 0x01, 0x00, 0x10};
+                              uint16_t crc = 0xFFFF;
+                              for (auto b : pkt) { crc ^= ((uint16_t)b) << 8; for (int j=0;j<8;j++) crc = (crc & 0x8000) ? (crc<<1)^0x1021 : crc<<1; }
+                              pkt.push_back(crc >> 8); pkt.push_back(crc & 0xFF);
+                              id(petkit_bus).write_array(pkt.data(), pkt.size());
+                              uint8_t n = seq + 1; if (n == 0) n = 1; id(command_seq) = n;
+                          - delay: 2000ms
+                    # Vila efter sista scoop så foderbitar hinner falla ut innan luckan stängs
+                    - delay: 2500ms
+                    # Stäng lucka
+                    - lambda: |-
+                        uint8_t seq = id(command_seq);
+                        std::vector<uint8_t> pkt = {0xAA, 0xAA, 0x09, 0x09, seq, 0x96, 0x96};
+                        uint16_t crc = 0xFFFF;
+                        for (auto b : pkt) { crc ^= ((uint16_t)b) << 8; for (int j=0;j<8;j++) crc = (crc & 0x8000) ? (crc<<1)^0x1021 : crc<<1; }
+                        pkt.push_back(crc >> 8); pkt.push_back(crc & 0xFF);
+                        id(petkit_bus).write_array(pkt.data(), pkt.size());
+                        uint8_t n = seq + 1; if (n == 0) n = 1; id(command_seq) = n;
+                        ESP_LOGI("petkit", "Steg %d klart — väg, anteckna, tryck igen för nästa", id(cal_step));
+            else:
+              # === NORMALT LÄGE: trigga Feed Now ===
+              - button.press: feed_now_button
+
+  - platform: template
+    name: "Food Low"
+    id: food_low_sensor
+    device_class: problem
+    lambda: |-
+      return id(food_low_state);
+    on_press:
+      then:
+        - lambda: |-
+            uint8_t seq = id(command_seq);
+            // Lower LED steady on (food low indicator)
+            std::vector<uint8_t> pkt = {0xAA, 0xAA, 0x0E, 0x0E, seq,
+                                        0x02, 0xFF, 0xFF, 0x00, 0x00, 0xFF, 0xFF};
+            uint16_t crc = 0xFFFF;
+            for (auto b : pkt) { crc ^= ((uint16_t)b) << 8; for (int j=0;j<8;j++) crc = (crc & 0x8000) ? (crc<<1)^0x1021 : crc<<1; }
+            pkt.push_back(crc >> 8); pkt.push_back(crc & 0xFF);
+            id(petkit_bus).write_array(pkt.data(), pkt.size());
+            uint8_t n = seq + 1; if (n == 0) n = 1; id(command_seq) = n;
+            ESP_LOGI("petkit", "Food Low: lighting indicator LED");
+    on_release:
+      then:
+        - lambda: |-
+            uint8_t seq = id(command_seq);
+            // Lower LED off (food OK)
+            std::vector<uint8_t> pkt = {0xAA, 0xAA, 0x0E, 0x0E, seq,
+                                        0x02, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF};
+            uint16_t crc = 0xFFFF;
+            for (auto b : pkt) { crc ^= ((uint16_t)b) << 8; for (int j=0;j<8;j++) crc = (crc & 0x8000) ? (crc<<1)^0x1021 : crc<<1; }
+            pkt.push_back(crc >> 8); pkt.push_back(crc & 0xFF);
+            id(petkit_bus).write_array(pkt.data(), pkt.size());
+            uint8_t n = seq + 1; if (n == 0) n = 1; id(command_seq) = n;
+            ESP_LOGI("petkit", "Food OK: indicator LED off");
+
+  - platform: template
+    name: "Door Activity"
+    lambda: |-
+      return id(door_state_raw) != 0;
+
+  - platform: template
+    name: "AC Adapter Connected"
+    device_class: plug
+    lambda: |-
+      return id(ac_voltage_raw) > 100;
+
+sensor:
+  - platform: uptime
+    name: "Uptime"
+
+  - platform: wifi_signal
+    name: "WiFi Signal"
+    update_interval: 60s
+
+  - platform: template
+    name: "Battery Voltage"
+    accuracy_decimals: 3
+    unit_of_measurement: "V"
+    update_interval: 5s
+    lambda: |-
+      return id(battery_voltage_mv) / 100.0f;
+
+  # Senaste utdelade portionen (uppdateras efter varje Feed)
+  - platform: template
+    name: "Last Feed Amount"
+    id: last_feed_sensor
+    accuracy_decimals: 1
+    unit_of_measurement: "g"
+    update_interval: never
+    lambda: |-
+      return id(last_feed_grams);
+
+  # Totalt utdelat idag (nollställs vid midnatt)
+  - platform: template
+    name: "Total Fed Today"
+    id: total_fed_today_sensor
+    accuracy_decimals: 1
+    unit_of_measurement: "g"
+    update_interval: 30s
+    lambda: |-
+      return id(total_fed_today);
+
+  # Visar nuvarande kalibrerings-steg (0 = inte aktiv, 1-5 = pågående)
+  - platform: template
+    name: "Calibration Step"
+    id: cal_step_sensor
+    accuracy_decimals: 0
+    update_interval: 2s
+    lambda: |-
+      return id(cal_active) ? id(cal_step) : 0;
+
+# Tunable dispense-parametrar — ändra direkt i HA, ingen reflash behövs.
+number:
+  # Användarvänlig portion i gram
+  - platform: template
+    name: "Portion Size"
+    id: portion_grams
+    min_value: 1
+    max_value: 50
+    step: 1
+    initial_value: 10
+    optimistic: true
+    mode: slider
+    unit_of_measurement: "g"
+
+
+
+button:
+  # HUVUDKNAPP: mata en portion via N scoops (varje scoop ≈ 5g per manualen)
+  # Sekvens: öppna lucka → loopa dispense N gånger → stäng lucka
+  - platform: template
+    id: feed_now_button
+    name: "Feed Now"
+    on_press:
+      then:
+        # Adaptiv scoop-beräkning från empirisk data.
+        # OBS: värdena beror på matarens fyllningsgrad — om tanken är full ger varje scoop mer.
+        # Uppdaterad efter mätning: 2 scoops = 16g, 3 scoops = 20g (lägre fyllning)
+        - lambda: |-
+            float grams = id(portion_grams).state;
+            int scoops;
+            if (grams <= 10.0f) scoops = 1;          // 1 scoop ≈ 8g
+            else if (grams <= 17.0f) scoops = 2;     // 2 scoops ≈ 16g
+            else if (grams <= 23.0f) scoops = 3;     // 3 scoops ≈ 20g
+            else if (grams <= 28.0f) scoops = 4;     // gissning ~22g
+            else if (grams <= 33.0f) scoops = 5;     // gissning ~25g
+            else {
+              // Linjär över 33g: ~3g per marginalscoop
+              scoops = 5 + (int)((grams - 25.0f) / 3.0f + 0.5f);
+            }
+            if (scoops < 1) scoops = 1;
+            if (scoops > 20) scoops = 20;
+            id(scoops_pending) = scoops;
+            ESP_LOGI("petkit", "FeedNow: target %.1fg → %d scoops (adaptive)", grams, scoops);
+
+        # Öppna lucka
+        - lambda: |-
+            uint8_t seq = id(command_seq);
+            std::vector<uint8_t> pkt = {0xAA, 0xAA, 0x09, 0x07, seq, 0x96, 0x96};
+            uint16_t crc = 0xFFFF;
+            for (auto b : pkt) { crc ^= ((uint16_t)b) << 8; for (int j=0;j<8;j++) crc = (crc & 0x8000) ? (crc<<1)^0x1021 : crc<<1; }
+            pkt.push_back(crc >> 8); pkt.push_back(crc & 0xFF);
+            id(petkit_bus).write_array(pkt.data(), pkt.size());
+            uint8_t n = seq + 1; if (n == 0) n = 1; id(command_seq) = n;
+            ESP_LOGI("petkit", "FeedNow: opening door");
+        - delay: 1800ms
+
+        # Loopa dispense N gånger med verifierade värden från Python-scriptet:
+        # dispense(3, 1, 0, 16) = duration=3, distance=1, direction=0, current=16
+        - repeat:
+            count: !lambda 'return id(scoops_pending);'
+            then:
+              - lambda: |-
+                  uint8_t seq = id(command_seq);
+                  std::vector<uint8_t> pkt = {0xAA, 0xAA, 0x0B, 0x0B, seq,
+                                              0x03, 0x01, 0x00, 0x10};
+                  uint16_t crc = 0xFFFF;
+                  for (auto b : pkt) { crc ^= ((uint16_t)b) << 8; for (int j=0;j<8;j++) crc = (crc & 0x8000) ? (crc<<1)^0x1021 : crc<<1; }
+                  pkt.push_back(crc >> 8); pkt.push_back(crc & 0xFF);
+                  id(petkit_bus).write_array(pkt.data(), pkt.size());
+                  uint8_t n = seq + 1; if (n == 0) n = 1; id(command_seq) = n;
+                  ESP_LOGI("petkit", "FeedNow: scoop");
+              - delay: 2000ms  # vänta tills scoop är klar och bitar fallit
+
+        # Vila innan lucka stängs så fastnar inte foderbitar
+        - delay: 2500ms
+
+        # Stäng lucka och uppdatera räknare
+        - lambda: |-
+            uint8_t seq = id(command_seq);
+            std::vector<uint8_t> pkt = {0xAA, 0xAA, 0x09, 0x09, seq, 0x96, 0x96};
+            uint16_t crc = 0xFFFF;
+            for (auto b : pkt) { crc ^= ((uint16_t)b) << 8; for (int j=0;j<8;j++) crc = (crc & 0x8000) ? (crc<<1)^0x1021 : crc<<1; }
+            pkt.push_back(crc >> 8); pkt.push_back(crc & 0xFF);
+            id(petkit_bus).write_array(pkt.data(), pkt.size());
+            uint8_t n = seq + 1; if (n == 0) n = 1; id(command_seq) = n;
+            float grams = id(portion_grams).state;
+            id(last_feed_grams) = grams;
+            id(total_fed_today) = id(total_fed_today) + grams;
+            id(last_feed_sensor).publish_state(grams);
+            id(total_fed_today_sensor).publish_state(id(total_fed_today));
+            ESP_LOGI("petkit", "FeedNow: done, closing door");
+
+  # KALIBRERING: 10 steg. Steg 1-5 = 10 scoops, Steg 6-10 = 5 scoops.
+  # Totalt 75 scoops ≈ 375g foder. Tryck fysiska manual feed-knappen för varje steg.
+  - platform: template
+    name: "Start Calibration Sequence"
+    on_press:
+      then:
+        - lambda: |-
+            id(cal_active) = true;
+            id(cal_step) = 0;
+            ESP_LOGI("petkit", "==== KALIBRERING STARTAD ====");
+            ESP_LOGI("petkit", "Ställ skål under utloppet. Tryck manual feed-knappen.");
+            ESP_LOGI("petkit", "Steg 1-5 = 10 scoops vardera, Steg 6-10 = 5 scoops vardera");
+
+  - platform: template
+    name: "Abort Calibration"
+    on_press:
+      then:
+        - lambda: |-
+            id(cal_active) = false;
+            id(cal_step) = 0;
+            ESP_LOGI("petkit", "==== KALIBRERING AVBRUTEN ====");
+
+  # DIAGNOS: testa om M0:s beep-funktion fungerar.
+  - platform: template
+    name: "Beep Test"
+    on_press:
+      then:
+        - lambda: |-
+            uint8_t seq = id(command_seq);
+            // beep: subcmd=3, ontime=200ms, offtime=200ms, count=3
+            std::vector<uint8_t> pkt = {0xAA, 0xAA, 0x0E, 0x0E, seq,
+                                        0x03,         // subcmd: beep
+                                        0x00, 0xC8,   // ontime 200ms
+                                        0x00, 0xC8,   // offtime 200ms
+                                        0x00, 0x03};  // count 3
+            uint16_t crc = 0xFFFF;
+            for (auto b : pkt) {
+              crc ^= ((uint16_t)b) << 8;
+              for (int j = 0; j < 8; j++) {
+                if (crc & 0x8000) crc = (crc << 1) ^ 0x1021;
+                else crc <<= 1;
+              }
+            }
+            pkt.push_back(crc >> 8);
+            pkt.push_back(crc & 0xFF);
+            id(petkit_bus).write_array(pkt.data(), pkt.size());
+            uint8_t n = seq + 1; if (n == 0) n = 1;
+            id(command_seq) = n;
+            ESP_LOGI("petkit", "Sent BEEP test (3x 200ms)");
+
+  # DIAGNOS: testa om luckmotor fungerar (separat från foderhjulet)
+  # 0x07 open feed door. Payload: duration_8b, strength_8b
+  - platform: template
+    name: "Open Door"
+    on_press:
+      then:
+        - lambda: |-
+            uint8_t seq = id(command_seq);
+            std::vector<uint8_t> pkt = {0xAA, 0xAA, 0x09, 0x07, seq, 0xFF, 0xFF};
+            uint16_t crc = 0xFFFF;
+            for (auto b : pkt) {
+              crc ^= ((uint16_t)b) << 8;
+              for (int j = 0; j < 8; j++) {
+                if (crc & 0x8000) crc = (crc << 1) ^ 0x1021;
+                else crc <<= 1;
+              }
+            }
+            pkt.push_back(crc >> 8);
+            pkt.push_back(crc & 0xFF);
+            id(petkit_bus).write_array(pkt.data(), pkt.size());
+            uint8_t n = seq + 1; if (n == 0) n = 1;
+            id(command_seq) = n;
+            ESP_LOGI("petkit", "Sent OPEN DOOR (255, 255)");
+
+  - platform: template
+    name: "Close Door"
+    on_press:
+      then:
+        - lambda: |-
+            uint8_t seq = id(command_seq);
+            std::vector<uint8_t> pkt = {0xAA, 0xAA, 0x09, 0x09, seq, 0xFF, 0xFF};
+            uint16_t crc = 0xFFFF;
+            for (auto b : pkt) {
+              crc ^= ((uint16_t)b) << 8;
+              for (int j = 0; j < 8; j++) {
+                if (crc & 0x8000) crc = (crc << 1) ^ 0x1021;
+                else crc <<= 1;
+              }
+            }
+            pkt.push_back(crc >> 8);
+            pkt.push_back(crc & 0xFF);
+            id(petkit_bus).write_array(pkt.data(), pkt.size());
+            uint8_t n = seq + 1; if (n == 0) n = 1;
+            id(command_seq) = n;
+            ESP_LOGI("petkit", "Sent CLOSE DOOR (255, 255)");
+
+

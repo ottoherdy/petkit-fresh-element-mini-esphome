@@ -1,0 +1,23 @@
+# ESPHome build artifacts
+.esphome/
+__pycache__/
+*.pyc
+
+# Personal secrets
+secrets.yaml
+
+# User-specific firmware backup (DO NOT commit — contains MAC address,
+# Wi-Fi credentials and other identifying info baked into stock firmware)
+Petkit-Backup/
+
+# Vendor documentation (copyright, not redistributable)
+*.pdf
+
+# macOS / temp
+.DS_Store
+~$*
+
+# Editor
+.vscode/
+.idea/
+.claude/
